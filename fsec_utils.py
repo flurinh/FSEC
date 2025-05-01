@@ -1,3 +1,5 @@
+# fsec_utils.py
+
 import pandas as pd
 import numpy as np
 import os
@@ -7,718 +9,609 @@ import scipy.signal
 from scipy.optimize import curve_fit
 from scipy.special import erf
 from itertools import combinations
+from tqdm.auto import tqdm
 
-
+# --- Data Loading --- (Unchanged from previous versions)
 def load_fsec_data_combined(directory='input', include_filename=False, filename_column='filename'):
-    """
-    Loads FSEC data from all CSV files in a specified directory and combines them
-    into a single DataFrame.
-
-    Args:
-        directory (str, optional): The directory containing the CSV files.
-            Defaults to 'input'.
-        include_filename (bool, optional): Whether to include a column with the
-            original filename. Defaults to False.
-        filename_column (str, optional): The name of the column to store
-            filenames (if include_filename is True). Defaults to 'filename'.
-
-    Returns:
-        pandas.DataFrame: A single DataFrame containing all the FSEC data.
-            Returns an empty DataFrame if no CSV files are found.
-        Raises FileNotFoundError if the input directory doesn't exist.
-
-    """
-
-    if not os.path.isdir(directory):
-        raise FileNotFoundError(f"Error: Directory '{directory}' not found.")
-
+    """Loads and combines FSEC data from CSV files."""
+    if not os.path.isdir(directory): raise FileNotFoundError(f"Error: Directory '{directory}' not found.")
     csv_files = glob.glob(os.path.join(directory, "*.csv"))
-
-    if not csv_files:
-        print(f"Warning: No CSV files found in '{directory}'.")
-        return pd.DataFrame()  # Return an empty DataFrame
-
+    if not csv_files: print(f"Warning: No CSV files found in '{directory}'."); return pd.DataFrame()
     all_data = []
-    for file_path in csv_files:
+    print(f"Found {len(csv_files)} CSV files in '{directory}'. Reading...")
+    for file_path in tqdm(csv_files, desc="Loading CSVs"):
         try:
-            df = pd.read_csv(file_path)
-            if include_filename:
-                filename = os.path.splitext(os.path.basename(file_path))[0]
-                df[filename_column] = filename  # Add filename as a column
+            df = pd.read_csv(file_path, on_bad_lines='warn')
+            if df.empty: print(f"Warning: File '{file_path}' empty/unparseable. Skipping."); continue
+            if include_filename: df[filename_column] = os.path.splitext(os.path.basename(file_path))[0]
             all_data.append(df)
-        except pd.errors.EmptyDataError:
-            print(f"Error: The file '{file_path}' is empty. Skipping.")
-        except pd.errors.ParserError:
-            print(f"Error: Could not parse the file '{file_path}'. Skipping.")
-        except Exception as e:
-            print(f"An unexpected error occurred while processing '{file_path}': {e}. Skipping.")
+        except Exception as e: print(f"Error processing '{file_path}': {e}. Skipping.")
+    if not all_data: print("Warning: No data loaded."); return pd.DataFrame()
+    try:
+        combined_df = pd.concat(all_data, ignore_index=True)
+        print(f"Successfully combined data from {len(all_data)} files.")
+        if 'Timepoint' not in combined_df.columns: print("Warning: 'Timepoint' column missing.")
+        return combined_df
+    except Exception as e: print(f"Error during concatenation: {e}"); return pd.DataFrame()
 
-    if not all_data:  # Check if all_data is empty (e.g., all files were skipped)
-        print("Warning: No data could be loaded from any files.")
-        return pd.DataFrame()
-
-    # Concatenate all DataFrames in the list
-    combined_df = pd.concat(all_data, ignore_index=True)
-    return combined_df
-
-
+# --- Signal Processing Utilities --- (Unchanged)
 def calculate_durbin_watson(residuals):
     """Calculates the Durbin-Watson statistic."""
-    diff_residuals = np.diff(residuals)
-    dw = np.sum(diff_residuals**2) / np.sum(residuals**2)
-    return dw * (len(residuals) / (len(residuals) - 1))
+    if residuals is None or len(residuals) < 2: return 2.0
+    residuals = np.asarray(residuals)[~np.isnan(residuals)]
+    if len(residuals) < 2: return 2.0
+    diff_residuals = np.diff(residuals); sum_sq_diff = np.sum(diff_residuals**2); sum_sq_res = np.sum(residuals**2)
+    if sum_sq_res == 0: return 2.0
+    dw = sum_sq_diff / sum_sq_res; n = len(residuals)
+    return dw * (n / (n - 1)) if n > 1 else dw
 
-
-def find_optimal_sg_window(signal, timepoints, polynomial_order=2, min_window=5, max_window=151):
-    """Finds optimal Savitzky-Golay window size (Durbin-Watson)."""
-    best_window = min_window
-    best_dw = 0
-    for window_size in range(min_window, max_window + 1, 2):
-        if window_size >= len(signal):
-            break
-        smoothed_signal = scipy.signal.savgol_filter(signal, window_size, polynomial_order)
-        residuals = signal - smoothed_signal  # Residuals from *original* signal
-        dw = calculate_durbin_watson(residuals)
-        if abs(dw - 2) < abs(best_dw - 2):
-            best_dw = dw
-            best_window = window_size
+def find_optimal_sg_window(signal, timepoints=None, polynomial_order=2, min_window=5, max_window=151):
+    """Finds optimal SG window size using Durbin-Watson."""
+    signal = np.asarray(signal); finite_mask = np.isfinite(signal)
+    if not np.any(finite_mask): print("Warning: No finite values. Cannot find optimal SG window."); return max(5, min_window if min_window % 2 != 0 else min_window + 1)
+    signal_finite = signal[finite_mask]; n_finite = len(signal_finite)
+    min_req_points = polynomial_order + 2
+    if n_finite < min_req_points or n_finite < min_window: print(f"Warning: Not enough finite points ({n_finite}). Using min window."); return max(5, min_window if min_window % 2 != 0 else min_window + 1)
+    best_window = min_window if min_window % 2 != 0 else min_window + 1
+    best_dw_dist = float('inf')
+    max_window_adj = min(max_window if max_window % 2 != 0 else max_window - 1, n_finite if n_finite % 2 != 0 else n_finite - 1)
+    max_window_adj = max(best_window, max_window_adj)
+    for window_size in range(best_window, max_window_adj + 1, 2):
+        if window_size <= polynomial_order: continue
+        try:
+            smoothed_signal = scipy.signal.savgol_filter(signal_finite, window_size, polynomial_order)
+            residuals = signal_finite - smoothed_signal; dw = calculate_durbin_watson(residuals); dw_dist = abs(dw - 2.0)
+            if dw_dist < best_dw_dist: best_dw_dist = dw_dist; best_window = window_size
+        except ValueError as e: print(f"Skipping SG window {window_size}: {e}")
     return best_window
 
-
 def snip_baseline(signal, window_size):
-    """Applies the SNIP baseline correction algorithm."""
-    s_lls = np.log(np.log(np.sqrt(signal + 1) + 1) + 1)
-    s_lls_filt = np.copy(s_lls)
-    for m in range(1, window_size + 1):
-        for i in range(m, len(s_lls_filt) - m):
-            s_lls_filt[i] = min(s_lls_filt[i], (s_lls_filt[i - m] + s_lls_filt[i + m]) / 2)
-    baseline = (np.exp(np.exp(s_lls_filt) - 1) - 1)**2 - 1
-    corrected_signal = signal - baseline
+    """Applies SNIP baseline correction, handling NaNs via interpolation."""
+    # (Code from previous version - unchanged)
+    signal = np.asarray(signal); original_nan_mask = np.isnan(signal); signal_interp = np.copy(signal)
+    if np.any(original_nan_mask):
+        # print("Warning: NaNs detected in signal for SNIP. Interpolating linearly.") # Less verbose
+        x_coords = np.arange(len(signal)); finite_mask = ~original_nan_mask
+        if np.sum(finite_mask) >= 2:
+            signal_interp[original_nan_mask] = np.interp(x_coords[original_nan_mask], x_coords[finite_mask], signal_interp[finite_mask])
+            if np.isnan(signal_interp).any(): signal_interp = pd.Series(signal_interp).fillna(method='ffill').fillna(method='bfill').values
+        else: signal_interp[original_nan_mask] = 0.0
+    signal_safe = np.maximum(signal_interp, 1e-6); s_lls = np.log(np.log(np.sqrt(signal_safe + 1) + 1) + 1); s_lls_filt = np.copy(s_lls)
+    half_window = max(1, int(window_size / 2))
+    for m in range(1, half_window + 1):
+        padded = np.pad(s_lls_filt, pad_width=m, mode='edge'); smoothed_padded = np.copy(padded)
+        for i in range(m, len(padded) - m): smoothed_padded[i] = min(padded[i], (padded[i - m] + padded[i + m]) / 2)
+        s_lls_filt = smoothed_padded[m:-m]
+    baseline_interp = (np.exp(np.exp(s_lls_filt) - 1) - 1)**2 - 1
+    baseline_interp = np.minimum(baseline_interp, signal_interp); baseline_interp = np.maximum(baseline_interp, 0)
+    corrected_signal_interp = signal_interp - baseline_interp
+    baseline = np.copy(baseline_interp); baseline[original_nan_mask] = np.nan
+    corrected_signal = np.copy(corrected_signal_interp); corrected_signal[original_nan_mask] = np.nan
     return corrected_signal, baseline
 
-
 def normalize_signal(signal, timepoints):
-    """
-    Performs baseline correction and returns the corrected signal, baseline,
-    and optimal SG window size.  This is Step 1.  Crucially, this function
-    *returns* the baseline.  The corrected signal has the baseline subtracted.
-    """
+    """Performs baseline correction using SNIP."""
+    # (Code from previous version - unchanged)
     sg_window_size = find_optimal_sg_window(signal, timepoints)
-    print(f"Optimal SG window size: {sg_window_size}")
-    corrected_signal, baseline = snip_baseline(signal, sg_window_size)
-    return corrected_signal, baseline, sg_window_size
+    print(f"Optimal SG window size for baseline/smoothing: {sg_window_size}")
+    snip_window = sg_window_size
+    corrected_signal, baseline = snip_baseline(signal, snip_window)
+    corrected_signal = np.clip(corrected_signal, 0, None, where=~np.isnan(corrected_signal))
+    baseline_finite = baseline[np.isfinite(baseline)]
+    baseline_std = np.std(baseline_finite) if len(baseline_finite) > 0 else 0.0
+    # print(f"Calculated Baseline Std Dev: {baseline_std:.4f}") # Moved print to analyze
+    return corrected_signal, baseline, baseline_std, sg_window_size
 
+# --- Peak and Shoulder Detection (Simplified Approach) ---
 
-def find_main_peaks(corrected_signal, timepoints, prominence, width, sg_window_size):
+# NEW Simple Peak Finder
+def find_peaks_abs_prominence(corrected_signal, timepoints, prominence, width):
     """
-    Finds main peaks using prominence and width on the *corrected* signal.
-    This is Step 2.  The corrected signal is normalized for peak finding.
-    """
-    # Normalize the *corrected* signal for peak finding.
-    normalized_corrected_signal = (corrected_signal - np.min(corrected_signal)) / (np.max(corrected_signal) - np.min(corrected_signal))
-    peak_indices, _ = scipy.signal.find_peaks(normalized_corrected_signal, prominence=prominence, width=width)
-    return peak_indices, normalized_corrected_signal # Return normalized signal
-
-
-def detect_shoulders(normalized_corrected_signal, timepoints, peak_indices, sg_window_size, baseline, shoulder_curvature, width):
-    """
-    Detects shoulders in the chromatogram after initial peak finding.
+    Finds peaks on the corrected signal using absolute prominence and width.
 
     Args:
-        normalized_corrected_signal: Baseline-corrected and normalized signal.
-        timepoints: Corresponding time values.
-        peak_indices: Indices of the main peaks (found in Step 2).
-        sg_window_size: Optimal Savitzky-Golay window size.
-        shoulder_curvature: Minimum curvature (prominence for 2nd deriv. peaks).
-        baseline: the calculated baseline
-        width: Minimum width parameter for peak detection
+        corrected_signal (np.array): Signal after baseline correction (original scale).
+        timepoints (np.array): Corresponding time points (for reporting).
+        prominence (float): Minimum absolute prominence (in signal units).
+        width (int): Minimum width of peaks in data points.
 
     Returns:
-        shoulder_indices: NumPy array of shoulder indices.
+        tuple: (peak_indices, properties)
     """
+    peak_indices = np.array([], dtype=int)
+    properties = {}
+    finite_mask = np.isfinite(corrected_signal)
+    if not np.any(finite_mask): print("Warning: Corrected signal has no finite values."); return peak_indices, properties
 
-    # 1. Calculate Second Derivative
-    second_derivative = scipy.signal.savgol_filter(normalized_corrected_signal, window_length=sg_window_size, polyorder=2, deriv=2)
+    print(f"--- find_peaks_abs_prominence ---")
+    print(f"  Using absolute prominence >= {prominence:.4f}")
+    print(f"  Using width >= {width}")
 
-    # 2. Estimate Noise in Second Derivative (thrsd)
-    h_values = []
-    for i in range(1, len(second_derivative) - 1):
-        h = abs(second_derivative[i] - (second_derivative[i-1] + second_derivative[i+1]) / 2)
-        h_values.append(h)
-    noise_estimate_sd = np.median(h_values)
-    thrsd = 5 * noise_estimate_sd  # Threshold on second derivative
-
-    # 3. Find Potential Shoulders (negative peaks in 2nd deriv)
-    shoulder_peaks_neg, _ = scipy.signal.find_peaks(-second_derivative, prominence=thrsd, width=width/4)
-
-    # 4. Signal Height Thresholds
-    thrh1 = 3 * np.std(baseline)  # Dynamic threshold based on baseline noise
-    thrh2 = 0  # Minimum signal height (can be adjusted)
-
-    shoulder_indices = []
-
-    # 5. find valleys
-    valley_indices, _ = scipy.signal.find_peaks(-normalized_corrected_signal, prominence=0.1, width=width)
-
-    # 6. Filter Shoulders
-    for shoulder_idx in shoulder_peaks_neg:
-        is_valid_shoulder = False
-
-        # Check Signal Height
-        if normalized_corrected_signal[shoulder_idx] >= thrh1 and normalized_corrected_signal[shoulder_idx] >= thrh2:
-
-            # Find Nearest Peak and Valley
-            nearest_peak = None
-            nearest_valley = None
-            min_peak_dist = float('inf')
-            min_valley_dist = float('inf')
-
-            for peak_idx in peak_indices:
-                dist = abs(shoulder_idx - peak_idx)
-                if dist < min_peak_dist:
-                    min_peak_dist = dist
-                    nearest_peak = peak_idx
-
-            for valley_idx in valley_indices:
-                dist = abs(shoulder_idx - valley_idx)
-                if dist < min_valley_dist:
-                    min_valley_dist = dist
-                    nearest_valley = valley_idx
-
-            # Peak-Valley-Shoulder Constraint
-            if nearest_peak is not None and nearest_valley is not None:
-                if (nearest_peak < shoulder_idx < nearest_valley) or \
-                   (nearest_valley < shoulder_idx < nearest_peak):
-                    is_valid_shoulder = True
-
-        # Add if valid, not a duplicate, and not already a peak
-        if is_valid_shoulder and shoulder_idx not in shoulder_indices and shoulder_idx not in peak_indices:
-            shoulder_indices.append(shoulder_idx)
-
-    return np.array(shoulder_indices, dtype=int)
-
-
-def find_peaks_with_prominence(combined_df, column_name, prominence=0.02, baseline_window=10, plot=True):
-    """
-    Performs baseline correction and finds peaks based on prominence for a single column.
-
-    Args:
-        combined_df (pd.DataFrame): The combined DataFrame.
-        column_name (str): The name of the column to process.
-        prominence (float): The minimum prominence for peak detection.
-        baseline_window (int): The window size for baseline correction.
-        plot (bool): Whether to generate a plot.
-
-    Returns:
-        tuple: (peak_indices, corrected_signal, baseline, normalized_signal) or (None, None, None, None) if errors.
-               peak_indices is a numpy array of integer indices.  corrected_signal, baseline, and normalized_signal
-               are numpy arrays of floats.
-    """
-    if 'Timepoint' not in combined_df.columns:
-        print("Error: 'Timepoint' column not found.")
-        return None, None, None, None
-    if column_name not in combined_df.columns:
-        print(f"Error: Column '{column_name}' not found.")
-        return None, None, None, None
-
-    signal = combined_df[column_name].values
-    timepoints = combined_df['Timepoint'].values
-
-    # Baseline Correction
-    corrected_signal, baseline = snip_baseline(signal, baseline_window)
-
-    # Normalize the *original* signal for prominence calculation (important!)
-    normalized_signal = (signal - np.min(signal)) / (np.max(signal) - np.min(signal))
-
-    # Find Peaks on the *corrected* signal
-    peak_indices, properties = scipy.signal.find_peaks(corrected_signal, prominence=prominence)
-
-    # --- Debugging Stats ---
-    print(f"--- Stats for column: {column_name} ---")
-    print(f"  Original signal range: {np.min(signal):.2f} - {np.max(signal):.2f}")
-    print(f"  Corrected signal range: {np.min(corrected_signal):.2f} - {np.max(corrected_signal):.2f}")
-    print(f"  Number of detected peaks: {len(peak_indices)}")
-    if len(peak_indices) > 0:
-        print(f"  Peak prominences: {properties['prominences']}") # Key for debugging
-        print(f"  Detected peak timepoints: {timepoints[peak_indices]}")
-        print(f"  Detected peak indices: {peak_indices}")
-
-    # Plotting
-    if plot:
-        plt.figure(figsize=(12, 6))
-        plt.plot(timepoints, signal, label='Original Signal', color='gray')
-        plt.plot(timepoints, baseline, label='Baseline', color='orange')
-        plt.plot(timepoints, corrected_signal, label='Corrected Signal', color='blue')
-        plt.plot(timepoints[peak_indices], corrected_signal[peak_indices], "x", color='red',
-                 label=f'Peaks (Prom ≥ {prominence:.2f})')
-
-        plt.xlabel('Timepoint')
-        plt.ylabel('Signal')
-        plt.title(f'Peak Detection with Prominence on {column_name}')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
-    return peak_indices, corrected_signal, baseline, normalized_signal
-
-
-class Chromatogram:
-    """
-    Class for handling chromatography data, including baseline correction and peak fitting.
-    """
-    
-    def __init__(self, df, cols={'time': 'Timepoint', 'signal': None}):
-        """
-        Initialize a Chromatogram object from a DataFrame.
-        
-        Args:
-            df (pd.DataFrame): The DataFrame containing chromatography data
-            cols (dict): Dictionary mapping of column names with keys 'time' and 'signal'
-        """
-        self.df = df.copy()
-        
-        # Assign time column
-        if cols['time'] in self.df.columns:
-            self.time_col = cols['time']
-        else:
-            raise ValueError(f"Time column '{cols['time']}' not found in DataFrame")
-            
-        # Assign signal column
-        if cols['signal'] is None:
-            # If no signal column specified, use first non-time column
-            signal_cols = [col for col in self.df.columns if col != self.time_col]
-            if not signal_cols:
-                raise ValueError("No signal columns found in DataFrame")
-            self.signal_col = signal_cols[0]
-        elif cols['signal'] in self.df.columns:
-            self.signal_col = cols['signal']
-        else:
-            raise ValueError(f"Signal column '{cols['signal']}' not found in DataFrame")
-        
-        # Extract the time and signal arrays
-        self.time = self.df[self.time_col].values
-        self.signal = self.df[self.signal_col].values
-        
-        # Initialize other attributes
-        self.baseline = None
-        self.corrected_signal = None
-        self.peaks = None
-        self.peak_fits = None
-        
-    def crop(self, time_range):
-        """
-        Crop the chromatogram to a specific time range.
-        
-        Args:
-            time_range (list): [min_time, max_time] to crop to
-        """
-        mask = (self.df[self.time_col] >= time_range[0]) & (self.df[self.time_col] <= time_range[1])
-        self.df = self.df[mask].copy()
-        self.time = self.df[self.time_col].values
-        self.signal = self.df[self.signal_col].values
-        
-        # Reset any processed data
-        self.baseline = None
-        self.corrected_signal = None
-        self.peaks = None
-        self.peak_fits = None
-        
-        return self
-    
-    def show(self, title=None):
-        """
-        Plot the chromatogram.
-        
-        Args:
-            title (str, optional): Plot title
-        """
-        fig, ax = plt.subplots(figsize=(8, 6))
-        
-        # Plot raw signal
-        ax.plot(self.time, self.signal, 'k-', label='raw chromatogram')
-        
-        # If baseline correction has been performed, plot that too
-        if self.corrected_signal is not None:
-            ax.plot(self.time, self.corrected_signal, 'b-', label='baseline corrected')
-            
-        # If peaks have been found, mark them
-        if self.peaks is not None:
-            ax.plot(self.time[self.peaks], self.corrected_signal[self.peaks], 'ro', label='peaks')
-            
-        # Set labels and title
-        ax.set_xlabel(self.time_col)
-        ax.set_ylabel(self.signal_col)
-        if title:
-            ax.set_title(title)
-            
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-        
-        return fig, ax
-    
-    def correct_baseline(self, window_size=50):
-        """
-        Apply baseline correction using SNIP algorithm.
-        
-        Args:
-            window_size (int): Window size for SNIP algorithm
-        """
-        self.corrected_signal, self.baseline = snip_baseline(self.signal, window_size)
-        return self
-    
-    def fit_peaks(self, prominence=0.01, width=5, buffer=0.1):
-        """
-        Find and fit peaks in the chromatogram.
-        
-        Args:
-            prominence (float): Minimum peak prominence
-            width (int): Minimum peak width
-            buffer (float): Buffer region around peaks
-        """
-        from tqdm.auto import tqdm
-        
-        # Perform baseline correction if not already done
-        if self.corrected_signal is None:
-            print("Performing baseline correction:")
-            self.correct_baseline()
-        
-        # Find peaks with scipy.signal.find_peaks
-        peak_indices, properties = scipy.signal.find_peaks(
-            self.corrected_signal, 
-            prominence=prominence, 
+    try:
+        # Find peaks directly on the finite part of the corrected signal
+        finite_indices = np.where(finite_mask)[0]
+        peaks_rel, properties = scipy.signal.find_peaks(
+            corrected_signal[finite_mask],
+            prominence=prominence,
             width=width
         )
-        
-        self.peaks = peak_indices
-        
-        # Define Gaussian peak function
-        def gaussian(x, amp, mu, sigma):
-            return amp * np.exp(-(x - mu)**2 / (2 * sigma**2))
-        
-        # Fit each peak with a Gaussian
-        self.peak_fits = []
-        
-        for peak_idx in tqdm(peak_indices, desc="Deconvolving mixture"):
-            # Extract region around the peak
-            peak_time = self.time[peak_idx]
-            
-            # Find closest points to the left and right of the peak ± buffer
-            left_idx = np.abs(self.time - (peak_time - buffer)).argmin()
-            right_idx = np.abs(self.time - (peak_time + buffer)).argmin()
-            
-            # Ensure we have enough points
-            if right_idx - left_idx < 3:
-                continue
-                
-            x_data = self.time[left_idx:right_idx+1]
-            y_data = self.corrected_signal[left_idx:right_idx+1]
-            
-            # Initial guess for Gaussian parameters
-            amp_guess = self.corrected_signal[peak_idx]
-            mu_guess = peak_time
-            sigma_guess = 0.1  # Arbitrary initial guess
-            
-            try:
-                # Fit the Gaussian
-                popt, _ = curve_fit(gaussian, x_data, y_data, p0=[amp_guess, mu_guess, sigma_guess])
-                
-                # Store the parameters
-                self.peak_fits.append({
-                    'index': peak_idx,
-                    'time': self.time[peak_idx],
-                    'amp': popt[0],
-                    'mu': popt[1],
-                    'sigma': popt[2],
-                    'area': popt[0] * popt[2] * np.sqrt(2 * np.pi)  # Area of Gaussian
-                })
-            except:
-                # If fitting fails, store with NaN parameters
-                self.peak_fits.append({
-                    'index': peak_idx,
-                    'time': self.time[peak_idx],
-                    'amp': np.nan,
-                    'mu': np.nan,
-                    'sigma': np.nan,
-                    'area': np.nan
-                })
-                
+        peak_indices = finite_indices[peaks_rel] # Map back to original indices
+    except Exception as e:
+         print(f"Error during find_peaks_abs_prominence: {e}")
+
+    print(f"  Found {len(peak_indices)} initial peaks.")
+    if len(peak_indices) > 0:
+         print(f"  Indices: {peak_indices}")
+         # print(f"  Timepoints: {timepoints[peak_indices]}") # Can be verbose
+         # print(f"  Prominences: {properties.get('prominences', 'N/A')}")
+    return peak_indices, properties
+
+
+# NEW Shoulder/Feature Detector based on Derivative Threshold
+def detect_features_by_derivative(corrected_signal, timepoints, main_peak_indices,
+                                 sg_window_size, shoulder_deriv_threshold,
+                                 peak_width_for_prox_check, debug=False):
+    """
+    Detects potential shoulder features based on second derivative threshold.
+
+    Args:
+        corrected_signal (np.array): Baseline-corrected signal (original scale).
+        timepoints (np.array): Corresponding time points.
+        main_peak_indices (np.array): Indices of initially detected main peaks.
+        sg_window_size (int): Window size for Savitzky-Golay derivative calculation.
+        shoulder_deriv_threshold (float): Minimum absolute value of the negative second derivative
+                                         peak height to consider a point as a candidate.
+        peak_width_for_prox_check (int): Width used for main peak finding, helps define
+                                        proximity tolerance for filtering.
+        debug (bool): Print detailed debug info.
+
+    Returns:
+        np.array: Indices of potential shoulder candidates (excluding main peaks).
+    """
+    potential_shoulder_indices = np.array([], dtype=int)
+    if corrected_signal is None or len(corrected_signal) < 5: return potential_shoulder_indices
+
+    corrected_signal = np.asarray(corrected_signal)
+    timepoints = np.asarray(timepoints)
+    main_peak_indices_set = set(main_peak_indices) if main_peak_indices is not None else set()
+
+    # 1. Calculate Second Derivative (on original scale corrected signal)
+    deriv_window = max(5, sg_window_size if sg_window_size % 2 != 0 else sg_window_size + 1)
+    if deriv_window >= len(corrected_signal):
+        print(f"Warning: Deriv window {deriv_window} too large. Cannot detect shoulders."); return potential_shoulder_indices
+
+    # Handle NaNs before derivative calculation
+    signal_for_deriv = np.copy(corrected_signal)
+    nan_mask_deriv = np.isnan(signal_for_deriv)
+    if np.any(nan_mask_deriv):
+        # print("Debug: Interpolating NaNs for derivative calculation.")
+        x_coords_d = np.arange(len(signal_for_deriv))
+        finite_mask_d = ~nan_mask_deriv
+        if np.sum(finite_mask_d) >= 2:
+             signal_for_deriv[nan_mask_deriv] = np.interp(x_coords_d[nan_mask_deriv], x_coords_d[finite_mask_d], signal_for_deriv[finite_mask_d])
+             if np.isnan(signal_for_deriv).any(): signal_for_deriv = pd.Series(signal_for_deriv).fillna(method='ffill').fillna(method='bfill').values
+        else: signal_for_deriv[nan_mask_deriv] = 0.0 # Fallback
+
+    try:
+        second_derivative = scipy.signal.savgol_filter(signal_for_deriv, deriv_window, 2, deriv=2)
+    except ValueError as e:
+        print(f"Error calculating second derivative: {e}. Cannot detect shoulders."); return potential_shoulder_indices
+
+    neg_second_derivative = -second_derivative
+    neg_second_derivative[~np.isfinite(neg_second_derivative)] = 0.0 # Handle potential NaNs/Infs from filter
+
+    if debug:
+        print("\n--- detect_features_by_derivative ---")
+        print(f"  Using derivative window: {deriv_window}")
+        print(f"  Negative 2nd Deriv range: {np.min(neg_second_derivative):.4f} / {np.max(neg_second_derivative):.4f}")
+        print(f"  Using derivative height threshold >= {shoulder_deriv_threshold:.4f}")
+
+
+    # 2. Find peaks in negative 2nd derivative exceeding the threshold
+    deriv_candidate_indices = np.array([], dtype=int)
+    deriv_peak_properties = {}
+    if shoulder_deriv_threshold >= 0: # Only find if threshold is non-negative
+        try:
+            deriv_candidate_indices, deriv_peak_properties = scipy.signal.find_peaks(
+                neg_second_derivative,
+                height=shoulder_deriv_threshold # Use height parameter
+                # width= ? # Optional: Add a minimum width for derivative peaks? max(1, int(peak_width_for_prox_check / 4)) ?
+            )
+        except Exception as e:
+             print(f"Error finding peaks in negative 2nd derivative: {e}")
+    else:
+        print("Warning: shoulder_deriv_threshold is negative, skipping derivative peak finding.")
+
+
+    if debug:
+        print(f"  Found {len(deriv_candidate_indices)} candidates based on derivative height.")
+        if len(deriv_candidate_indices) > 0:
+            print(f"  Candidate indices: {deriv_candidate_indices}")
+            # print(f"  Candidate derivative heights: {deriv_peak_properties.get('peak_heights', 'N/A')}") # 'heights' used in find_peaks
+
+    # 3. Filter out candidates too close to main peaks
+    peak_tolerance = max(2, int(peak_width_for_prox_check / 5))
+    potential_shoulder_indices_list = []
+    for idx in deriv_candidate_indices:
+        is_main_peak = False
+        for main_idx in main_peak_indices_set:
+            if abs(idx - main_idx) <= peak_tolerance:
+                is_main_peak = True
+                break
+        if not is_main_peak:
+            potential_shoulder_indices_list.append(idx)
+
+    potential_shoulder_indices = np.array(sorted(potential_shoulder_indices_list), dtype=int)
+
+    if debug:
+        print(f"  Found {len(potential_shoulder_indices)} potential shoulders after removing main peak proximity.")
+        if len(potential_shoulder_indices) > 0:
+             print(f"  Potential shoulder indices: {potential_shoulder_indices}")
+
+    return potential_shoulder_indices
+
+
+# NEW Simplified Main Analysis Function
+def analyze_chromatogram_simplified(combined_df, column_name,
+                                    peak_prominence=5.0, # Absolute units now
+                                    peak_width=10,
+                                    shoulder_deriv_threshold=0.01, # Absolute deriv units
+                                    min_feature_height=1.0, # Absolute signal units
+                                    plot=True, debug=False):
+    """
+    Analyzes chromatogram using absolute thresholds for peaks and derivative features.
+
+    Args:
+        combined_df (pd.DataFrame): Input data.
+        column_name (str): Signal column name.
+        peak_prominence (float): Minimum absolute prominence for main peaks (corrected signal units).
+        peak_width (int): Minimum width for main peaks (points).
+        shoulder_deriv_threshold (float): Minimum height of peak in negative 2nd derivative
+                                         to be considered a shoulder candidate.
+        min_feature_height (float): Minimum height on corrected signal for ANY feature
+                                   (peak or shoulder) to be kept.
+        plot (bool): Generate plots.
+        debug (bool): Print debug info for shoulder detection.
+
+    Returns:
+        dict: Results dictionary or None on error.
+    """
+    if 'Timepoint' not in combined_df.columns: print("Error: 'Timepoint' column missing."); return None
+    if column_name not in combined_df.columns: print(f"Error: Column '{column_name}' missing."); return None
+    signal = combined_df[column_name].values; timepoints = combined_df['Timepoint'].values # Assuming time_col is defined globally or passed
+    if len(signal) == 0 or np.all(np.isnan(signal)): print(f"Error: Signal '{column_name}' empty/all NaN."); return None
+    print(f"\n--- Analyzing Column: {column_name} (Simplified Method) ---")
+
+    # 1. Baseline Correction
+    corrected_signal, baseline, baseline_std, sg_window_size = normalize_signal(signal, timepoints)
+    print(f"  Baseline Std Dev (Original Scale): {baseline_std:.4f}")
+
+    # 2. Find Initial Main Peaks (Absolute Prominence)
+    initial_peak_indices, initial_peak_props = find_peaks_abs_prominence(
+        corrected_signal, timepoints, prominence=peak_prominence, width=peak_width)
+
+    # 3. Find Potential Shoulders (Absolute Derivative Threshold)
+    potential_shoulder_indices = detect_features_by_derivative(
+        corrected_signal=corrected_signal,
+        timepoints=timepoints,
+        main_peak_indices=initial_peak_indices,
+        sg_window_size=sg_window_size,
+        shoulder_deriv_threshold=shoulder_deriv_threshold,
+        peak_width_for_prox_check=peak_width,
+        debug=debug
+    )
+
+    # 4. Apply Minimum Feature Height Filter to BOTH Peaks and Shoulders
+    final_peak_indices = []
+    final_shoulder_indices = []
+
+    print(f"--- Applying Minimum Feature Height Filter >= {min_feature_height:.4f} ---")
+    # Filter initial peaks
+    for idx in initial_peak_indices:
+        if 0 <= idx < len(corrected_signal) and np.isfinite(corrected_signal[idx]) and corrected_signal[idx] >= min_feature_height:
+            final_peak_indices.append(idx)
+        elif debug: print(f"    - Peak at index {idx} rejected by height filter (height={corrected_signal[idx]:.4f})")
+
+    # Filter potential shoulders
+    for idx in potential_shoulder_indices:
+        if 0 <= idx < len(corrected_signal) and np.isfinite(corrected_signal[idx]) and corrected_signal[idx] >= min_feature_height:
+            # Double-check it wasn't already accepted as a peak (shouldn't happen if filtering in detect_features is correct, but safe)
+            if idx not in final_peak_indices:
+                 final_shoulder_indices.append(idx)
+        elif debug: print(f"    - Shoulder candidate at index {idx} rejected by height filter (height={corrected_signal[idx]:.4f})")
+
+    final_peak_indices = np.array(sorted(final_peak_indices), dtype=int)
+    final_shoulder_indices = np.array(sorted(final_shoulder_indices), dtype=int)
+
+    print(f"  Final Peaks: {len(final_peak_indices)}")
+    print(f"  Final Shoulders: {len(final_shoulder_indices)}")
+
+    # 5. Plotting
+    if plot:
+        try:
+            fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True, gridspec_kw={'height_ratios': [3, 1]})
+            ax1.plot(timepoints, signal, label='Original Signal', color='gray', alpha=0.6, lw=1.5)
+            ax1.plot(timepoints, corrected_signal, label='Corrected Signal', color='blue', lw=1.5)
+            ax1.plot(timepoints, baseline, label=f'Baseline (SNIP, win={sg_window_size})', color='orange', linestyle='--', lw=1.5)
+            ax1.axhline(min_feature_height, color='red', linestyle=':', alpha=0.5, lw=1, label=f'Min Height ({min_feature_height:.2f})') # Show height threshold
+
+            n_peaks = len(final_peak_indices)
+            if n_peaks > 0: ax1.plot(timepoints[final_peak_indices], corrected_signal[final_peak_indices], "x", color='red', markersize=10, mew=2, label=f'Peaks ({n_peaks})', linestyle='None')
+            else: ax1.plot([],[], "x", color='red', markersize=10, mew=2, label='Peaks (0)')
+            n_shoulders = len(final_shoulder_indices)
+            if n_shoulders > 0:
+                ax1.plot(timepoints[final_shoulder_indices], corrected_signal[final_shoulder_indices], "o", color='green', markersize=8, label=f'Shoulders ({n_shoulders})', alpha=0.9, markerfacecolor='none', mew=2, linestyle='None')
+            else: ax1.plot([],[], "o", color='green', markersize=8, markerfacecolor='none', mew=2, label='Shoulders (0)')
+
+            ax1.set_title(f'Simplified Peak/Shoulder Detection ({column_name})'); ax1.set_ylabel('Signal')
+            ax1.legend(loc='upper right'); ax1.grid(True, alpha=0.4, linestyle=':')
+            finite_y = np.concatenate([sig[np.isfinite(sig)] for sig in [signal, corrected_signal, baseline] if sig is not None])
+            if len(finite_y)>0: y_min, y_max = np.min(finite_y), np.max(finite_y); y_buffer = (y_max - y_min) * 0.05 if (y_max - y_min)>0 else 0.1; ax1.set_ylim(bottom=min(y_min - y_buffer, -y_buffer), top=y_max + y_buffer) # Ensure 0 visible if data positive
+
+            # Bottom plot: Negative Second derivative
+            deriv_window = max(5, sg_window_size if sg_window_size % 2 != 0 else sg_window_size + 1)
+            if deriv_window < len(corrected_signal):
+                 signal_for_deriv = np.copy(corrected_signal); nan_mask_deriv = np.isnan(signal_for_deriv) # Re-handle NaNs locally for derivative plot
+                 if np.any(nan_mask_deriv):
+                     x_coords_d = np.arange(len(signal_for_deriv)); finite_mask_d = ~nan_mask_deriv
+                     if np.sum(finite_mask_d) >= 2: signal_for_deriv[nan_mask_deriv] = np.interp(x_coords_d[nan_mask_deriv], x_coords_d[finite_mask_d], signal_for_deriv[finite_mask_d]);
+                     if np.isnan(signal_for_deriv).any(): signal_for_deriv = pd.Series(signal_for_deriv).fillna(method='ffill').fillna(method='bfill').values
+                     else: signal_for_deriv[nan_mask_deriv] = 0.0
+                 try:
+                     second_derivative = scipy.signal.savgol_filter(signal_for_deriv, deriv_window, 2, deriv=2)
+                     neg_second_derivative = -second_derivative
+                     neg_second_derivative[~np.isfinite(neg_second_derivative)] = 0.0 # Handle Inf/NaN from filter edges
+                     ax2.plot(timepoints, neg_second_derivative, label='-2nd Deriv', color='purple', lw=1.5)
+                     ax2.axhline(shoulder_deriv_threshold, color='magenta', linestyle=':', alpha=0.7, lw=1, label=f'Deriv Thresh ({shoulder_deriv_threshold:.3f})')
+                     # Mark locations (optional, can get cluttered)
+                     # ax2.plot(timepoints[final_peak_indices], neg_second_derivative[final_peak_indices], "x", color='red', markersize=8, mew=2, label='Peak Locs', linestyle='None')
+                     # ax2.plot(timepoints[final_shoulder_indices], neg_second_derivative[final_shoulder_indices], "o", color='green', markerfacecolor='none', mew=2, markersize=6, label='Shoulder Locs', linestyle='None')
+                 except Exception as e: print(f"Error plotting derivative: {e}"); ax2.text(0.5, 0.5, "Error plotting derivative", ha='center', va='center', transform=ax2.transAxes)
+            else: ax2.text(0.5, 0.5, "Signal too short for 2nd derivative plot", ha='center', va='center', transform=ax2.transAxes)
+            time_col_name = combined_df.columns[0] # Get actual time column name
+            ax2.set_xlabel(f'{time_col_name}'); ax2.set_ylabel('Neg. 2nd Deriv'); ax2.axhline(0, color='black', linewidth=0.5, linestyle='--'); ax2.grid(True, alpha=0.4, linestyle=':')
+            ax2.legend(loc='upper right'); ax2.autoscale(enable=True, axis='y', tight=True); plt.tight_layout(pad=0.5); plt.show()
+        except Exception as e: print(f"Error during plotting: {e}")
+
+    # 6. Return Results
+    results = {
+        'column_name': column_name, 'timepoints': timepoints, 'original_signal': signal,
+        'baseline': baseline, 'corrected_signal': corrected_signal, 'baseline_std': baseline_std,
+        'peak_indices': final_peak_indices, #'initial_peak_properties': initial_peak_props, # Maybe too verbose
+        'shoulder_indices': final_shoulder_indices,
+        'sg_window_size': sg_window_size,
+        # Store parameters used
+        'params': {'peak_prominence': peak_prominence, 'peak_width': peak_width,
+                   'shoulder_deriv_threshold': shoulder_deriv_threshold, 'min_feature_height': min_feature_height}
+    }
+    print(f"--- Analysis Finished for: {column_name} (Simplified Method) ---")
+    return results
+
+# --- Keep Chromatogram Class ---
+# (It will need updating if used with the new simplified analysis, but leave as is for now)
+class Chromatogram:
+     """Class for handling chromatography data (using older methods)."""
+     # (Code from previous version - unchanged)
+     def __init__(self, df, cols={'time': 'Timepoint', 'signal': None}):
+        if not isinstance(df, pd.DataFrame) or df.empty: raise ValueError("Input must be a non-empty pandas DataFrame.")
+        self.df_orig = df.copy(); self.df = df.copy()
+        if cols.get('time') in self.df.columns: self.time_col = cols['time']
+        else: raise ValueError(f"Time column '{cols.get('time')}' not found in DataFrame columns: {list(self.df.columns)}")
+        sig_col_name = cols.get('signal')
+        if sig_col_name is None:
+            signal_cols = [col for col in self.df.columns if col != self.time_col and pd.api.types.is_numeric_dtype(self.df[col])]
+            if not signal_cols: raise ValueError("No potential numeric signal columns found besides time column.")
+            self.signal_col = signal_cols[0]; print(f"Warning: No signal column specified. Using: '{self.signal_col}'")
+        elif sig_col_name in self.df.columns:
+            if not pd.api.types.is_numeric_dtype(self.df[sig_col_name]): raise ValueError(f"Signal column '{sig_col_name}' is not numeric.")
+            self.signal_col = sig_col_name
+        else: raise ValueError(f"Signal column '{sig_col_name}' not found in DataFrame columns: {list(self.df.columns)}")
+        self.time = self.df[self.time_col].values; self.signal = self.df[self.signal_col].values
+        if np.isnan(self.time).any(): print(f"Warning: Time column '{self.time_col}' contains NaN values.")
+        if np.isnan(self.signal).any(): print(f"Warning: Signal column '{self.signal_col}' contains NaN values.")
+        self.reset_processing()
+
+     def reset_processing(self):
+        self.baseline = None; self.corrected_signal = None; self.peaks = None
+        self.peak_properties = None; self.peak_fits = None; self.reconstructed_signal = None
+        self.fit_assessment = None; self.sg_window_size = None; self.corrected_signal_range = None
+
+     def crop(self, time_range):
+        if not isinstance(time_range, (list, tuple)) or len(time_range) != 2: raise ValueError("time_range must be [min_time, max_time]")
+        min_t, max_t = time_range
+        if not (isinstance(min_t,(int,float)) and isinstance(max_t,(int,float))): raise ValueError("time_range values must be numeric")
+        mask = (self.df_orig[self.time_col] >= min_t) & (self.df_orig[self.time_col] <= max_t)
+        self.df = self.df_orig[mask].copy()
+        self.time = self.df[self.time_col].values; self.signal = self.df[self.signal_col].values
+        self.reset_processing()
+        print(f"Cropped chromatogram to time range: [{min_t:.3f}, {max_t:.3f}]. Data points: {len(self.time)}")
+        if len(self.time) == 0: print("Warning: Crop resulted in zero data points.")
         return self
-    
-    def assess_fit(self):
-        """
-        Assess the quality of peak fitting.
-        
-        Returns:
-            pd.DataFrame: Dataframe with fit quality metrics
-        """
-        if self.peaks is None or self.corrected_signal is None:
-            raise ValueError("Must run fit_peaks() before assessing fit")
-            
-        # Calculate the reconstructed chromatogram
-        def gaussian(x, amp, mu, sigma):
-            return amp * np.exp(-(x - mu)**2 / (2 * sigma**2))
-        
-        reconstructed = np.zeros_like(self.time, dtype=float)
-        for peak in self.peak_fits:
-            if not np.isnan(peak['amp']):
-                reconstructed += gaussian(self.time, peak['amp'], peak['mu'], peak['sigma'])
-                
-        # Find continuous regions of interest
-        # 1. Start with peak regions
-        is_peak_region = np.zeros_like(self.time, dtype=bool)
-        
-        for i, peak in enumerate(self.peak_fits):
-            peak_idx = peak['index']
-            
-            # Find points where signal is >1% of peak height
-            threshold = 0.01 * self.corrected_signal[peak_idx]
-            
-            # Scan left
-            left_idx = peak_idx
-            while left_idx > 0 and self.corrected_signal[left_idx] > threshold:
-                left_idx -= 1
-                
-            # Scan right
-            right_idx = peak_idx
-            while right_idx < len(self.time)-1 and self.corrected_signal[right_idx] > threshold:
-                right_idx += 1
-                
-            # Mark this region
-            is_peak_region[left_idx:right_idx+1] = True
-            
-        # 2. Identify interpeak regions
-        interpeak_regions = []
-        peak_regions = []
-        
-        # Variables to track regions
-        in_region = False
-        start_idx = 0
-        is_peak = False
-        
-        for i in range(len(self.time)):
-            if not in_region:
-                # Starting a new region
-                if self.corrected_signal[i] > 0.000001:
-                    in_region = True
-                    start_idx = i
-                    is_peak = is_peak_region[i]
-            else:
-                # In middle of a region
-                if is_peak != is_peak_region[i]:
-                    # Region type changed, end this region
-                    if is_peak:
-                        peak_regions.append((start_idx, i-1))
-                    else:
-                        interpeak_regions.append((start_idx, i-1))
-                    # Start a new region
-                    start_idx = i
-                    is_peak = is_peak_region[i]
-                elif i == len(self.time) - 1:
-                    # Last point, end the region
-                    if is_peak:
-                        peak_regions.append((start_idx, i))
-                    else:
-                        interpeak_regions.append((start_idx, i))
-                    in_region = False
-                    
-        # Calculate quality metrics for each region
+
+     def show(self, title=None, show_corrected=True, show_peaks=True, show_reconstructed=False):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        if len(self.time) == 0: ax.text(0.5, 0.5, "No data.", ha='center', va='center'); ax.set_title("Empty Chromatogram"); return fig, ax
+        ax.plot(self.time, self.signal, color='gray', label='Original Signal', alpha=0.8)
+        if show_corrected and self.corrected_signal is not None:
+            ax.plot(self.time, self.baseline, color='orange', linestyle='--', label='Baseline')
+            ax.plot(self.time, self.corrected_signal, color='blue', label='Corrected Signal')
+        if show_reconstructed and self.reconstructed_signal is not None:
+            ax.plot(self.time, self.reconstructed_signal, color='purple', linestyle=':', label='Reconstructed Signal')
+        if show_peaks and self.peaks is not None and self.corrected_signal is not None:
+             valid_peak_indices = self.peaks[(self.peaks >= 0) & (self.peaks < len(self.time))]
+             n_peaks_plot = len(valid_peak_indices)
+             if n_peaks_plot > 0: ax.plot(self.time[valid_peak_indices], self.corrected_signal[valid_peak_indices], 'x', color='red', markersize=10, mew=2, label=f'Detected Peaks ({n_peaks_plot})')
+             else: ax.plot([], [], 'x', color='red', markersize=10, mew=2, label='Detected Peaks (0)')
+        ax.set_xlabel(self.time_col); ax.set_ylabel(self.signal_col)
+        ax.set_title(title if title else f"Chromatogram: {self.signal_col}")
+        ax.legend(); ax.grid(True, alpha=0.3); plt.tight_layout()
+        return fig, ax
+
+     def correct_baseline(self, window_size=None):
+        if len(self.signal) == 0: print("Warning: Cannot correct baseline on empty signal."); return self
+        if window_size is None: self.sg_window_size = find_optimal_sg_window(self.signal, self.time); print(f"Using optimal SG window for baseline: {self.sg_window_size}")
+        else: window_size = int(window_size); self.sg_window_size = max(5, window_size if window_size % 2 != 0 else window_size + 1)
+        self.corrected_signal, self.baseline = snip_baseline(self.signal, self.sg_window_size)
+        self.corrected_signal = np.clip(self.corrected_signal, 0, None, where=~np.isnan(self.corrected_signal))
+        finite_corr = self.corrected_signal[np.isfinite(self.corrected_signal)]; self.corrected_signal_range = np.ptp(finite_corr) if len(finite_corr) > 0 else 0.0
+        print("Baseline correction applied.")
+        return self
+
+     def find_peaks(self, prominence=5.0, width=10): # Changed default prominence interpretation
+         """Finds peaks using ABSOLUTE prominence."""
+         if self.corrected_signal is None: print("Baseline correction not performed. Running correct_baseline first."); self.correct_baseline()
+         if len(self.corrected_signal) == 0: print("Warning: Cannot find peaks on empty corrected signal."); self.peaks = np.array([], dtype=int); self.peak_properties = {}; return self
+         # Use the simple absolute prominence finder
+         self.peaks, self.peak_properties = find_peaks_abs_prominence(
+              self.corrected_signal, self.time, prominence=prominence, width=width)
+         print(f"Found {len(self.peaks)} peaks.")
+         return self
+
+     # --- fit_peaks and assess_fit methods remain the same as previous version ---
+     # --- They operate on self.peaks found by the (now absolute) find_peaks method ---
+     def fit_peaks(self, prominence=0.05, width=10, buffer=0.1):
+        """Fits peaks individually using Gaussian models (simple method)."""
+        if self.peaks is None: print("Peaks not found. Running find_peaks first."); self.find_peaks(prominence=prominence, width=width) # Using default absolute prominence here now
+        if self.corrected_signal is None: print("Error: Corrected signal not available for fitting."); return self
+        if len(self.corrected_signal) == 0 : print("Warning: Corrected signal is empty, cannot fit peaks."); return self
+        if self.peaks is None or len(self.peaks) == 0: print("No peaks detected to fit."); self.peak_fits = []; self.reconstructed_signal = np.zeros_like(self.time, dtype=float); return self
+        def gaussian(x, amp, mu, sigma): sigma = max(1e-6, sigma); return amp * np.exp(-(x - mu)**2 / (2 * sigma**2))
+        self.peak_fits = []
+        print(f"Fitting {len(self.peaks)} detected peaks individually with Gaussians...")
+        time_diff = np.mean(np.diff(self.time)) if len(self.time) > 1 else 0.01
+
+        for peak_idx in tqdm(self.peaks, desc="Fitting individual peaks"):
+            fit_result = {'index': peak_idx, 'time': np.nan, 'amp': np.nan,'mu': np.nan, 'sigma': np.nan, 'area': np.nan, 'fit_success': False}
+            if not (0 <= peak_idx < len(self.time)): print(f"Warning: Skipping invalid peak index {peak_idx}"); self.peak_fits.append(fit_result); continue
+            fit_result['time'] = self.time[peak_idx]; peak_height = self.corrected_signal[peak_idx];
+            if not np.isfinite(peak_height): peak_height = 0
+            left_time = fit_result['time'] - buffer; right_time = fit_result['time'] + buffer
+            fit_mask = (self.time >= left_time) & (self.time <= right_time) & np.isfinite(self.corrected_signal)
+            x_data = self.time[fit_mask]; y_data = self.corrected_signal[fit_mask]
+            if len(x_data) < 3: print(f"Warning: Skipping peak at t={fit_result['time']:.3f} - not enough finite points ({len(x_data)})"); self.peak_fits.append(fit_result); continue
+            amp_guess = peak_height if peak_height > 0 else 1e-3; mu_guess = fit_result['time']; sigma_guess = buffer / 3.0
+            if self.peak_properties and 'widths' in self.peak_properties:
+                 try: # Simplified width estimation logic
+                      prop_indices = np.where(self.peaks == peak_idx)[0]
+                      if len(prop_indices) > 0 and prop_indices[0] < len(self.peak_properties['widths']):
+                           peak_width_points = self.peak_properties['widths'][prop_indices[0]]
+                           peak_width_time = peak_width_points * time_diff
+                           if peak_width_time > 1e-6: sigma_guess = max(peak_width_time / 2.355, time_diff * 1.5)
+                 except Exception: pass
+            p0 = [amp_guess, mu_guess, sigma_guess]; bounds = ([0, left_time, time_diff/2.0], [amp_guess * 5 + 1e-3, right_time, buffer * 5])
+            try:
+                popt, pcov = curve_fit(gaussian, x_data, y_data, p0=p0, maxfev=5000, bounds=bounds)
+                fit_result.update({'amp': popt[0],'mu': popt[1],'sigma': popt[2], 'area': popt[0] * popt[2] * np.sqrt(2 * np.pi),'fit_success': True})
+                if popt[2] < (time_diff / 2.0): pass # Potentially mark as uncertain if sigma too small?
+            except Exception as e: print(f"Warning: Fit failed for peak at t={fit_result['time']:.3f}. Error: {e}")
+            self.peak_fits.append(fit_result)
+        self.reconstructed_signal = np.zeros_like(self.time, dtype=float)
+        for pf in self.peak_fits:
+             if pf.get('fit_success', False) and not np.isnan(pf['amp']): self.reconstructed_signal += gaussian(self.time, pf['amp'], pf['mu'], pf['sigma'])
+        return self
+
+     def assess_fit(self, tolerance=0.10, print_report=True, use_ansi_colors=False):
+        """Assess quality of individual peak fitting."""
+        # (assess_fit code remains unchanged from previous version)
+        if self.peaks is None or self.corrected_signal is None or self.peak_fits is None: print("Error: Must run find_peaks() and fit_peaks() before assessing fit."); return None
+        if len(self.corrected_signal) == 0: print("Warning: Corrected signal empty."); return None
+        if self.reconstructed_signal is None: print("Error: Reconstructed signal not calculated."); return None
+        valley_indices = np.array([], dtype=int)
+        if np.any(np.isfinite(self.corrected_signal)):
+            try:
+                finite_corr_mask = np.isfinite(self.corrected_signal); finite_indices_corr = np.where(finite_corr_mask)[0]
+                if len(finite_indices_corr) > 5:
+                    valley_indices_rel, _ = scipy.signal.find_peaks(-self.corrected_signal[finite_corr_mask], prominence=0.01 * np.ptp(self.corrected_signal[finite_corr_mask]), width=3)
+                    valley_indices = finite_indices_corr[valley_indices_rel]
+            except Exception as e: print(f"Warning: Could not find valleys: {e}")
+        peak_indices_valid = self.peaks[(self.peaks >=0) & (self.peaks < len(self.time))]
+        boundaries = np.sort(np.concatenate(([0], peak_indices_valid, valley_indices, [len(self.time) - 1])))
+        unique_boundaries = np.unique(boundaries[boundaries >= 0])
+        regions = []
+        if len(unique_boundaries) > 1:
+            for i in range(len(unique_boundaries) - 1):
+                start_idx = unique_boundaries[i]; end_idx = unique_boundaries[i+1]
+                if start_idx >= end_idx: continue
+                is_peak_region = any(start_idx <= pk_idx <= end_idx for pk_idx in peak_indices_valid)
+                regions.append({'start_idx': start_idx, 'end_idx': end_idx, 'type': 'peak' if is_peak_region else 'interpeak'})
+        else: print("Warning: Could not define valid regions for assessment.")
         results = []
-        
-        # Define a function to calculate R-score (ratio of areas)
-        def r_score(signal_area, reconstructed_area):
-            if signal_area == 0:
-                return np.inf
-            return reconstructed_area / signal_area
-        
-        # Process interpeak regions
-        for i, (start_idx, end_idx) in enumerate(interpeak_regions):
-            region_time = self.time[start_idx:end_idx+1]
-            region_signal = self.corrected_signal[start_idx:end_idx+1]
-            region_reconstructed = reconstructed[start_idx:end_idx+1]
-            
-            # Skip very small regions
-            if len(region_time) < 3:
-                continue
-                
-            # Calculate metrics
-            signal_area = np.trapz(region_signal, region_time)
-            reconstructed_area = np.trapz(region_reconstructed, region_time)
-            r = r_score(signal_area, reconstructed_area)
-            
-            # Calculate variance and Fano factor
-            signal_variance = np.var(region_signal)
-            signal_mean = np.mean(region_signal)
-            fano = signal_variance / (signal_mean + 1e-10)  # Avoid division by zero
-            
-            results.append({
-                'window_id': i+1,
-                'time_start': region_time[0],
-                'time_end': region_time[-1],
-                'signal_area': signal_area,
-                'inferred_area': reconstructed_area,
-                'signal_variance': signal_variance,
-                'signal_mean': signal_mean,
-                'signal_fano_factor': fano,
-                'reconstruction_score': r,
-                'window_type': 'interpeak'
-            })
-            
-        # Process peak regions
-        for i, (start_idx, end_idx) in enumerate(peak_regions):
-            region_time = self.time[start_idx:end_idx+1]
-            region_signal = self.corrected_signal[start_idx:end_idx+1]
-            region_reconstructed = reconstructed[start_idx:end_idx+1]
-            
-            # Skip very small regions
-            if len(region_time) < 3:
-                continue
-                
-            # Calculate metrics
-            signal_area = np.trapz(region_signal, region_time)
-            reconstructed_area = np.trapz(region_reconstructed, region_time)
-            r = r_score(signal_area, reconstructed_area)
-            
-            # Calculate variance and Fano factor
-            signal_variance = np.var(region_signal)
-            signal_mean = np.mean(region_signal)
-            fano = signal_variance / (signal_mean + 1e-10)  # Avoid division by zero
-            
-            results.append({
-                'window_id': i+1,
-                'time_start': region_time[0],
-                'time_end': region_time[-1],
-                'signal_area': signal_area,
-                'inferred_area': reconstructed_area,
-                'signal_variance': signal_variance,
-                'signal_mean': signal_mean,
-                'signal_fano_factor': fano,
-                'reconstruction_score': r,
-                'window_type': 'peak'
-            })
-            
-        # Convert to DataFrame
-        df_results = pd.DataFrame(results)
-        
-        # Apply tolerance criteria for R-score
-        tolerance = 0.01  # 1% tolerance
-        
-        df_results['applied_tolerance'] = tolerance
-        
-        # Apply different criteria based on window type
-        peak_mask = df_results['window_type'] == 'peak'
-        interpeak_mask = df_results['window_type'] == 'interpeak'
-        
-        # For peak regions, check if R is within 1 ± tolerance
-        df_results.loc[peak_mask, 'status'] = np.where(
-            (df_results.loc[peak_mask, 'reconstruction_score'] >= 1-tolerance) & 
-            (df_results.loc[peak_mask, 'reconstruction_score'] <= 1+tolerance),
-            'valid', 'needs review'
-        )
-        
-        # Get max Fano factor from peak regions for comparison
-        if peak_mask.any():
-            max_peak_fano = df_results.loc[peak_mask, 'signal_fano_factor'].max()
-        else:
-            max_peak_fano = 1.0
-            
-        # For interpeak regions, compare Fano factor to peak regions
-        df_results.loc[interpeak_mask, 'status'] = np.where(
-            (df_results.loc[interpeak_mask, 'signal_fano_factor'] <= 0.001 * max_peak_fano),
-            'low signal', 'needs review'
-        )
-        
-        # Generate a report
-        print("\n-------------------Chromatogram Reconstruction Report Card----------------------\n")
-        
-        print("Reconstruction of Peaks")
-        print("=======================\n")
-        for _, row in df_results[df_results['window_type'] == 'peak'].iterrows():
-            if row['status'] == 'valid':
-                print(f"\033[1m\033[42m\033[30mA+, Success:  Peak Window {row['window_id']} (t: {row['time_start']:.3f} - {row['time_end']:.3f}) R-Score = {row['reconstruction_score']:.4f}\033[0m\n")
+        def r_score(sig_a, recon_a):
+            if not (np.isfinite(sig_a) and np.isfinite(recon_a)): return np.nan
+            return 1.0 if abs(sig_a) < 1e-9 and abs(recon_a) < 1e-9 else (np.inf * np.sign(recon_a) if abs(sig_a) < 1e-9 else recon_a / sig_a)
+        for i, region in enumerate(regions):
+            start_idx, end_idx = region['start_idx'], region['end_idx']; region_time = self.time[start_idx:end_idx+1]
+            finite_mask_region = np.isfinite(self.corrected_signal[start_idx:end_idx+1])
+            region_signal_finite = self.corrected_signal[start_idx:end_idx+1][finite_mask_region]; region_reconstructed_finite = self.reconstructed_signal[start_idx:end_idx+1][finite_mask_region]
+            region_time_finite = region_time[finite_mask_region]
+            if len(region_time_finite) < 3: continue
+            try:
+                signal_area = np.trapz(region_signal_finite, region_time_finite); reconstructed_area = np.trapz(region_reconstructed_finite, region_time_finite)
+                r = r_score(signal_area, reconstructed_area); residual = region_signal_finite - region_reconstructed_finite
+                rmse = np.sqrt(np.mean(residual**2)) if len(residual) > 0 else 0.0
+                results.append({'window_id': i + 1, 'time_start': region_time_finite[0], 'time_end': region_time_finite[-1],'signal_area': signal_area, 'inferred_area': reconstructed_area, 'reconstruction_score (R)': r, 'rmse': rmse, 'window_type': region['type']})
+            except Exception as e: print(f"Warning: Could not calculate metrics for region {i+1}: {e}")
+        if not results: print("Warning: No valid regions found for assessment."); return None
+        df_results = pd.DataFrame(results); df_results['applied_tolerance'] = tolerance; df_results['status'] = 'needs review'
+        peak_mask = df_results['window_type'] == 'peak'; interpeak_mask = df_results['window_type'] == 'interpeak'
+        df_results.loc[peak_mask, 'status'] = np.where((df_results.loc[peak_mask, 'reconstruction_score (R)'] >= 1 - tolerance) & (df_results.loc[peak_mask, 'reconstruction_score (R)'] <= 1 + tolerance), 'valid', 'failed (R-score)')
+        finite_corrected_signal = self.corrected_signal[np.isfinite(self.corrected_signal)]; finite_time = self.time[np.isfinite(self.corrected_signal)]
+        total_signal_area = np.trapz(finite_corrected_signal, finite_time) if len(finite_time)>1 else 0.0;
+        if abs(total_signal_area) < 1e-9: total_signal_area = 1.0
+        df_results.loc[interpeak_mask, 'status'] = np.where((np.abs(df_results.loc[interpeak_mask, 'inferred_area']) < 0.05 * abs(total_signal_area)) & (np.abs(df_results.loc[interpeak_mask, 'reconstruction_score (R)']) < 2.0), 'low signal (ok)', 'failed (interpeak fit)')
+        df_results.loc[interpeak_mask & (np.abs(df_results['inferred_area']) < 0.01 * abs(total_signal_area)) & ~np.isfinite(df_results['reconstruction_score (R)']), 'status'] = 'low signal (ok)'
+        self.fit_assessment = df_results
+        if print_report: # (Report printing logic unchanged)
+            CLR_OK = "\033[1m\033[42m\030m" if use_ansi_colors else ""; CLR_FAIL = "\033[1m\033[41m\037m" if use_ansi_colors else ""; CLR_WARN = "\033[1m\033[43m\030m" if use_ansi_colors else ""; CLR_END = "\033[0m" if use_ansi_colors else ""
+            print("\n-------------------Chromatogram Reconstruction Report Card----------------------\n"); print("(Assessment based on individual Gaussian fits - may be inaccurate for overlaps)")
+            print("\nReconstruction of Peak Regions\n============================\n"); peak_report = df_results[df_results['window_type'] == 'peak']
+            if peak_report.empty: print("No peak regions assessed.")
             else:
-                print(f"\033[1m\033[41m\033[37mF, Failed:  Peak Window {row['window_id']} (t: {row['time_start']:.3f} - {row['time_end']:.3f}) R-Score = {row['reconstruction_score']:.4f}\033[0m\n")
-                print(f"Peak region {row['window_id']} is not well reconstructed by Gaussian mixture.")
-                print(f"This indicates that the peak may have a non-Gaussian shape, or that multiple")
-                print(f"overlapping peaks might be present that weren't resolved.\n")
-        
-        print("Signal Reconstruction of Interpeak Windows")
-        print("==========================================")
-        print("                  ")
-        for _, row in df_results[df_results['window_type'] == 'interpeak'].iterrows():
-            if row['status'] == 'low signal':
-                continue
-            elif row['reconstruction_score'] > 1.15:
-                print(f"\033[1m\033[43m\033[30mC-, Needs Review:  Interpeak Window {row['window_id']} (t: {row['time_start']:.3f} - {row['time_end']:.3f}) R-Score = {row['reconstruction_score']:.4f} & Fano Ratio = {row['signal_fano_factor']/max_peak_fano:.4f}\033[0m")
-                print(f"Interpeak window {row['window_id']} is not well reconstructed by mixture, but has a small Fano factor")
-                print(f"compared to peak region(s). This is likely acceptable, but visually check this region.\n")
+                for _, row in peak_report.iterrows(): t_range = f"t: {row['time_start']:.3f}-{row['time_end']:.3f}"; r_val = row['reconstruction_score (R)']; status = row['status']; print(f"{CLR_OK if status == 'valid' else CLR_FAIL}{'A+' if status=='valid' else 'F'}, {'Success' if status=='valid' else 'Failed'}: Peak Window {row['window_id']} ({t_range}) R={r_val:.3f}{CLR_END}\n");
+            print("\nReconstruction of Interpeak Regions\n=================================\n"); interpeak_report = df_results[df_results['window_type'] == 'interpeak']
+            if interpeak_report.empty: print("No interpeak regions assessed.")
             else:
-                print(f"\033[1m\033[42m\033[30mA, Good:  Interpeak Window {row['window_id']} (t: {row['time_start']:.3f} - {row['time_end']:.3f}) R-Score = {row['reconstruction_score']:.4f}\033[0m\n")
-        
-        print("\n--------------------------------------------------------------------------------\n")
-        
+                 for _, row in interpeak_report.iterrows(): t_range = f"t: {row['time_start']:.3f}-{row['time_end']:.3f}"; r_val = row['reconstruction_score (R)']; inferred_a = row['inferred_area']; status = row['status']; print(f"{CLR_OK if status == 'low signal (ok)' else CLR_WARN}{'OK' if status=='low signal (ok)' else 'C'}, {'Good' if status=='low signal (ok)' else 'Needs Review'}: Interpeak Window {row['window_id']} ({t_range}) R={r_val:.3f}, Inferred Area={inferred_a:.3e}{CLR_END}\n");
+            print("\n--------------------------------------------------------------------------------\n")
         return df_results
 
 
-def analyze_chromatogram(combined_df, column_name, prominence=0.5, width=20,
-                       shoulder_curvature=0.005, max_peaks_per_window=3, plot=True):
-    """Analyzes a chromatogram column."""
-    if 'Timepoint' not in combined_df.columns or column_name not in combined_df.columns:
-        print("Error: Required column(s) not found.")
-        return None
 
-    signal = combined_df[column_name].values
-    timepoints = combined_df['Timepoint'].values
+# --- Example Usage Block --- (Updated)
+if __name__ == '__main__':
+    print("--- Running fsec_utils.py in test mode (Simplified Analysis) ---")
+    time_col = 'Timepoint' # Define time column name
 
-    # --- Step 1: Baseline Correction and Normalization ---
-    corrected_signal, baseline, sg_window_size = normalize_signal(signal, timepoints)
-    
-    # --- Step 2: Find Main Peaks ---
-    peak_indices, normalized_corrected_signal = find_main_peaks(corrected_signal, timepoints, prominence, width, sg_window_size)
+    # Create dummy data if 'input' directory doesn't exist or is empty
+    if not os.path.exists('input') or not glob.glob('input/*.csv'):
+        print("Creating dummy input data...")
+        if not os.path.exists('input'): os.makedirs('input')
+        time = np.linspace(0, 10, 500); peak1 = 10 * np.exp(-(time - 3)**2 / (2 * 0.5**2))
+        baseline_dummy = 2 + 0.1 * time + np.random.rand(500) * 0.5; signal1 = peak1 + baseline_dummy
+        df1 = pd.DataFrame({time_col: time, 'Sample_A': signal1}); df1.to_csv('input/sample_A.csv', index=False)
+        peak2 = 8 * np.exp(-(time - 5.5)**2 / (2 * 0.4**2)); peak3 = 6 * np.exp(-(time - 6.5)**2 / (2 * 0.6**2))
+        shoulder = 2 * np.exp(-(time - 5.0)**2 / (2 * 0.2**2)); signal2 = peak2 + peak3 + shoulder + baseline_dummy + 1
+        df2 = pd.DataFrame({time_col: time, 'Sample_B': signal2}); df2.to_csv('input/sample_B.csv', index=False)
+        print("Dummy data created: sample_A.csv, sample_B.csv")
 
-    if plot:
-        plt.figure(figsize=(12, 6))
-        plt.plot(timepoints, normalized_corrected_signal, label='Corrected Signal', color='blue')
-        plt.plot(timepoints[peak_indices], normalized_corrected_signal[peak_indices], "x", color='red', label='Peaks')
-        plt.title('Step 2: Main Peak Detection')
-        plt.xlabel('Timepoint')
-        plt.ylabel('Signal')
-        plt.legend()
-        plt.grid(True)
-        plt.show()
+    print("\nTesting Data Loading..."); combined = load_fsec_data_combined(directory='input')
+    if not combined.empty:
+        print(f"Loaded combined data shape: {combined.shape}"); print(f"Columns: {list(combined.columns)}")
 
-    # --- Step 3: Detect Shoulders ---
-    shoulder_indices = detect_shoulders(normalized_corrected_signal, timepoints, peak_indices,
-                                       sg_window_size, baseline, shoulder_curvature, width)
-
-    if plot:  # Plot after Step 3
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
-        ax1.plot(timepoints, signal, label='Original Signal', color='gray') #plot original
-        ax1.plot(timepoints, corrected_signal, label='Corrected Signal', color='blue')
-        ax1.plot(timepoints, baseline, label='Baseline', color='orange')
-        ax1.plot(timepoints[peak_indices], corrected_signal[peak_indices], "x", color='red', label='Peaks')
-        ax1.plot(timepoints[shoulder_indices], corrected_signal[shoulder_indices], "o",
-                color='green', label='Shoulders', markersize=5)
-        ax1.set_title('Peak and Shoulder Detection')
-        ax1.set_ylabel('Signal')
-        ax1.legend()
-        ax1.grid(True)
-
-        # Plot second derivative in the second subplot
-        second_derivative = scipy.signal.savgol_filter(normalized_corrected_signal, window_length=sg_window_size, polyorder=2, deriv=2)
-        ax2.plot(timepoints, -second_derivative * 10, label='-2nd Deriv (Scaled)', color='purple')  # Scaled for visibility
-        ax2.set_xlabel('Timepoint')
-        ax2.set_ylabel('Second Derivative (Scaled)')
-        ax2.grid(True)
-        ax2.legend()
-        plt.tight_layout()
-        plt.show()
-
-    # --- Step 4: Return Results ---
-    results = {
-        'column_name': column_name,
-        'peak_indices': peak_indices,
-        'shoulder_indices': shoulder_indices,
-        'corrected_signal': normalized_corrected_signal,
-        'baseline': baseline,
-        'sg_window_size': sg_window_size
-    }
-    return results
+        # --- Test Simplified Analysis on Sample B ---
+        if 'Sample_B' in combined.columns:
+            print("\nTesting analyze_chromatogram_simplified on Sample_B...")
+            # Adjust thresholds based on expected absolute values of dummy data
+            results_b = analyze_chromatogram_simplified(
+                combined, 'Sample_B',
+                peak_prominence=1.0,   # Expect peaks > 1 unit high
+                peak_width=5,
+                shoulder_deriv_threshold=0.5, # Requires significant curvature change
+                min_feature_height=0.5,     # Feature must be > 0.5 units high
+                plot=True, debug=True)
+            if results_b:
+                print("\nSimplified Analysis Results (Sample_B):"); print(f"  SG Window: {results_b['sg_window_size']}")
+                print(f"  Peaks Found: {len(results_b['peak_indices'])} at times {results_b['timepoints'][results_b['peak_indices']] if len(results_b['peak_indices'])>0 else '[]'}")
+                print(f"  Shoulders Found: {len(results_b['shoulder_indices'])} at times {results_b['timepoints'][results_b['shoulder_indices']] if len(results_b['shoulder_indices'])>0 else '[]'}")
+    else: print("Could not load data for testing.")
+    print("\n--- fsec_utils.py test finished ---")
